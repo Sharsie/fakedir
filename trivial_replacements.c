@@ -85,6 +85,7 @@ SUBST(int, posix_spawn, (pid_t *pid, char const *path, const posix_spawn_file_ac
 ENDSUBST
 
 SUBST(void *, dlopen, (char const *path, int mode))
+    // unlock due to recursive function, see above
     pthread_mutex_unlock(&_lock);
     my_dlopen(path, mode);
 ENDSUBST
@@ -309,6 +310,7 @@ SUBST(int, getattrlistat,
 ENDSUBST
 
 SUBST(char const *, getcwd, (char *buf, size_t size))
+    // libSystem getcwd() calls upon our other functions
     pthread_mutex_unlock(&_lock);
     char const *cwd = getcwd(buf, size);
     pthread_mutex_lock(&_lock);
