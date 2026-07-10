@@ -119,7 +119,8 @@ char const *rewrite_path(char const *path)
     if (startswith("/.", path))
         path += 2;
     if (pattern && startswith(pattern, path)) {
-        strlcpy(pathbuf + strlen(target), path + strlen(pattern), PATH_MAX);
+        size_t target_len = strlen(target);
+        strlcpy(pathbuf + target_len, path + strlen(pattern), PATH_MAX - target_len);
         return pathbuf;
     } else {
         if (path != dedupbuf)
@@ -133,7 +134,8 @@ char const *rewrite_path_rev(char const *path)
     if (startswith("/.", path))
         path += 2;
     if (target && startswith(target, path)) {
-        strlcpy(rpathbuf + strlen(pattern), path + strlen(target), PATH_MAX);
+        size_t pattern_len = strlen(pattern);
+        strlcpy(rpathbuf + pattern_len, path + strlen(target), PATH_MAX - pattern_len);
         return rpathbuf;
     } else {
         if (path != dedupbuf)
@@ -142,64 +144,147 @@ char const *rewrite_path_rev(char const *path)
     }
 }
 
-char const *resolve_symlink_parent(int fd, char const *path)
-{
-    char workpath[PATH_MAX];
-    char *fname = NULL;
+/*
+ * Component-by-component path resolution (like realpath), applying the
+ * pattern=>target rewrite before every kernel probe. This is required
+ * because symlink *targets* routinely point back into the pattern dir
+ * (e.g. a nix profile chain: ~/.nix-profile -> .../profile-2-link ->
+ * /nix/store/...-user-environment, whose entries are again symlinks to
+ * /nix/store/...). Every intermediate component must therefore be
+ * readlink'd through the rewrite, not just prefixes of the original path.
+ *
+ * `out` accumulates the resolved path in *logical* (un-rewritten) space;
+ * rewriting happens only for kernel probes and the final result.
+ */
+static char resbufs[2][PATH_MAX];
+static int resbuf_idx = 0;
 
-    strlcpy(workpath, path, PATH_MAX);
-    for (int i = strlen(workpath); i > 0; i--) {
-        if (workpath[i] == '/') {
-            workpath[i] = 0;
-            fname = workpath + i + 1;
+static char const *resolve_path_common(int fd, char const *path, bool keep_last)
+{
+    char rest[PATH_MAX];    // unprocessed components, '/'-separated
+    char out[PATH_MAX];     // logical resolved-so-far
+    char comp[PATH_MAX];
+    char lbuf[PATH_MAX];
+    char probe[PATH_MAX];
+    char tmp[PATH_MAX];
+    int nlinks = 0;
+    char *res = resbufs[resbuf_idx];
+    resbuf_idx = (resbuf_idx + 1) % 2;
+
+    if (!path || !path[0]) {
+        // preserve syscall semantics for the empty path (ENOENT)
+        strlcpy(res, path ? path : "", PATH_MAX);
+        return res;
+    }
+
+    bool is_abs = (path[0] == '/');
+    if (fd == AT_FDCWD)
+        fd = -1;
+
+    strlcpy(rest, is_abs ? path + 1 : path, PATH_MAX);
+    out[0] = 0;
+
+    while (rest[0]) {
+        char *slash = strchr(rest, '/');
+        if (slash) {
+            size_t clen = slash - rest;
+            memcpy(comp, rest, clen);
+            comp[clen] = 0;
+            memmove(rest, slash + 1, strlen(slash + 1) + 1);
+        } else {
+            strlcpy(comp, rest, PATH_MAX);
+            rest[0] = 0;
+        }
+        if (!comp[0] || !strcmp(comp, "."))
+            continue;
+        if (!strcmp(comp, "..")) {
+            char *ls = strrchr(out, '/');
+            if (ls)
+                *ls = 0;
+            else
+                out[0] = 0;
+            continue;
+        }
+        strlcpy(probe, out, PATH_MAX);
+        if (is_abs || out[0])
+            strlcat(probe, "/", PATH_MAX);
+        strlcat(probe, comp, PATH_MAX);
+
+        if (keep_last && !rest[0]) {
+            // final component belongs to the caller (create/readlink/etc.)
+            strlcpy(out, probe, PATH_MAX);
             break;
         }
-    }
-    if (!fname) {
-        strlcpy(linkbuf, rewrite_path(path), PATH_MAX);
-        return linkbuf;
+
+        ssize_t ll = readlinkat(fd == -1 ? AT_FDCWD : fd,
+                                rewrite_path(probe), lbuf, PATH_MAX - 1);
+        if (ll < 0 || ++nlinks > 40) {
+            // not a symlink (or ELOOP guard): keep component as-is
+            strlcpy(out, probe, PATH_MAX);
+            continue;
+        }
+        lbuf[ll] = 0;
+        if (lbuf[0] == '/') {
+            out[0] = 0;
+            is_abs = true;
+            strlcpy(tmp, lbuf + 1, PATH_MAX);
+        } else {
+            strlcpy(tmp, lbuf, PATH_MAX);
+        }
+        if (rest[0]) {
+            strlcat(tmp, "/", PATH_MAX);
+            strlcat(tmp, rest, PATH_MAX);
+        }
+        strlcpy(rest, tmp, PATH_MAX);
     }
 
-    resolve_symlink_at(fd, workpath);
-    strlcat(linkbuf, "/", PATH_MAX);
-    strlcat(linkbuf, fname, PATH_MAX);
-    return rewrite_path(linkbuf);
+    if (!out[0])
+        strlcpy(out, is_abs ? "/" : ".", PATH_MAX);
+    strlcpy(res, rewrite_path(out), PATH_MAX);
+    DEBUG("resolve%s('%s') = '%s'", keep_last ? "_parent" : "", path, res);
+    return res;
+}
+
+char const *resolve_symlink_parent(int fd, char const *path)
+{
+    return resolve_path_common(fd, path, true);
 }
 
 char const *resolve_symlink_at(int fd, char const *path)
 {
-    char wpath[PATH_MAX];
-    strlcpy(wpath, path, PATH_MAX);
-
-    ssize_t linklen;
-    if (fd != -1)
-        linklen = readlinkat(fd, rewrite_path(path), linkbuf, PATH_MAX);
-    else
-        linklen = readlink(rewrite_path(path), linkbuf, PATH_MAX);
-
-    if (linklen < 0) {
-        // Symlink resolution failed, recurse through path
-        char const *result = resolve_symlink_parent(fd, path);
-        return result;
-    }
-    linkbuf[linklen] = 0;
-    if (linkbuf[0] != '/') {
-        // Symlink is relative, copy it to end of buffer then rewrite parent
-        int off = strlen(wpath);
-        for (; off > 0; off--)
-            if (wpath[off] == '/')
-                break;
-        for (int i = off + linklen; i >= 0; i--)
-            linkbuf[i + off + 1] = linkbuf[i];
-        for (int i = off; i >= 0; i--)
-            linkbuf[i] = wpath[i];
-    }
-    char const *result = rewrite_path(linkbuf);
-    return resolve_symlink_at(fd, result);
+    return resolve_path_common(fd, path, false);
 }
 
 int my_posix_spawn(pid_t *pid, char const *path, const posix_spawn_file_actions_t *facts, const posix_spawnattr_t *attrp, char *argv[], char *envp[])
 {
+    // /bin/sh is SIP-protected: exec'ing it strips DYLD_* and the child
+    // loses the fakedir view of /nix. If PATH offers another sh/bash
+    // (e.g. a store bash inside a nix build), prefer that.
+    // (cherry-picked from ToxicPine/fakedir ef647a7)
+    char shellbuf[PATH_MAX];
+    if (!strcmp(path, "/bin/sh")) {
+        char const *pathenv = getenv("PATH");
+        if (pathenv && *pathenv) {
+            char paths[ARG_MAX];
+            strlcpy(paths, pathenv, sizeof paths);
+            char *saveptr = NULL;
+            for (char *dir = strtok_r(paths, ":", &saveptr); dir; dir = strtok_r(NULL, ":", &saveptr)) {
+                if (!*dir)
+                    dir = ".";
+                snprintf(shellbuf, sizeof shellbuf, "%s/sh", dir);
+                if (strcmp(shellbuf, "/bin/sh") && !access(resolve_symlink(shellbuf), X_OK)) {
+                    path = shellbuf;
+                    break;
+                }
+                snprintf(shellbuf, sizeof shellbuf, "%s/bash", dir);
+                if (strcmp(shellbuf, "/bin/bash") && !access(resolve_symlink(shellbuf), X_OK)) {
+                    path = shellbuf;
+                    break;
+                }
+            }
+        }
+    }
+
     if (pid != PSP_EXEC)
         DEBUG("posix_spawn(%s) was called.", path);
     int tgt = my_open(path, O_RDONLY, 0000);
@@ -214,7 +299,11 @@ int my_posix_spawn(pid_t *pid, char const *path, const posix_spawn_file_actions_
 
     if (canexec && !strncmp(shebang, "#!", 2)) {
         DEBUG("Executable '%s' has a shebang, parsing...", path);
-        return pspawn_parse_shebang(pid, resolve_symlink(path), shebang, facts, attrp, argv, envp);
+        // Resolve only the parent: the kernel passes the *original* path as
+        // the script argument ($0), and multi-call scripts dispatch on its
+        // basename. Parent resolution still yields a path a non-injected
+        // interpreter can open, without renaming the leaf.
+        return pspawn_parse_shebang(pid, resolve_symlink_parent(-1, path), shebang, facts, attrp, argv, envp);
     }
 
     return pspawn_patch_envp(pid, resolve_symlink(path), facts, attrp, argv, envp);

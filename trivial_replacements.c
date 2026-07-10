@@ -1,5 +1,6 @@
 #include "common.h"
 #include <string.h>
+#include <stdarg.h>
 
 /**
  * @file        trivial_replacements.c
@@ -13,6 +14,35 @@
 
 int my_posix_spawn(pid_t *pid, char const *path, const posix_spawn_file_actions_t *facts, const posix_spawnattr_t *attrp, char *argv[], char *envp[]);
 void macho_add_dependencies(char const *path, void (*e)(char const *));
+extern char **environ;
+
+// PATH-searching front end for the p-variants of the exec family
+// (cherry-picked from ToxicPine/fakedir ef647a7)
+static int spawnp_resolved(pid_t *pid, char const *file, const posix_spawn_file_actions_t *facts, const posix_spawnattr_t *attrp, char *argv[], char *envp[])
+{
+    if (strchr(file, '/'))
+        return my_posix_spawn(pid, file, facts, attrp, argv, envp);
+
+    char const *pathenv = getenv("PATH");
+    if (!pathenv || !*pathenv)
+        pathenv = "/bin:/usr/bin";
+
+    char paths[ARG_MAX];
+    strlcpy(paths, pathenv, sizeof paths);
+
+    char *saveptr = NULL;
+    for (char *dir = strtok_r(paths, ":", &saveptr); dir; dir = strtok_r(NULL, ":", &saveptr)) {
+        char candidate[PATH_MAX];
+        if (!*dir)
+            dir = ".";
+        snprintf(candidate, sizeof candidate, "%s/%s", dir, file);
+        if (!access(resolve_symlink(candidate), X_OK))
+            return my_posix_spawn(pid, candidate, facts, attrp, argv, envp);
+    }
+
+    errno = ENOENT;
+    return -1;
+}
 
 #define SUBST(T, n, p)  \
     T _my_##n p;                                         \
@@ -33,11 +63,11 @@ void macho_add_dependencies(char const *path, void (*e)(char const *));
 
 static char const *rs_at_flagged(int fd, char const *path, int flags)
 {
-    if (flags & AT_FDCWD && flags & AT_SYMLINK_NOFOLLOW)
-        return resolve_symlink_parent(-1, path);
-    else if (flags & AT_FDCWD)
-        return resolve_symlink(path);
-    else if (flags & AT_SYMLINK_NOFOLLOW)
+    // AT_FDCWD is a special fd value (-2), not a bit in `flags`;
+    // resolve_* helpers expect -1 for "relative to cwd"
+    if (fd == AT_FDCWD)
+        fd = -1;
+    if (flags & AT_SYMLINK_NOFOLLOW)
         return resolve_symlink_parent(fd, path);
     else
         return resolve_symlink_at(fd, path);
@@ -68,7 +98,7 @@ void *my_dlopen(char const *path, int mode)
 
 int my_open(char const *name, int flags, int mode)
 {
-    char *n;
+    char const *n;
     if (flags & (O_SYMLINK|O_NOFOLLOW))
         n = RS_PARENT(name);
     else
@@ -80,8 +110,20 @@ SUBST(int, execve, (char const *path, char *argv[], char *envp[]))
     my_posix_spawn(PSP_EXEC, path, NULL, NULL, argv, envp);
 ENDSUBST
 
+SUBST(int, execv, (char const *path, char *argv[]))
+    my_posix_spawn(PSP_EXEC, path, NULL, NULL, argv, environ);
+ENDSUBST
+
+SUBST(int, execvp, (char const *path, char *argv[]))
+    spawnp_resolved(PSP_EXEC, path, NULL, NULL, argv, environ);
+ENDSUBST
+
 SUBST(int, posix_spawn, (pid_t *pid, char const *path, const posix_spawn_file_actions_t *facts, const posix_spawnattr_t *attrp, char *argv[], char *envp[]))
     my_posix_spawn(pid, path, facts, attrp, argv, envp);
+ENDSUBST
+
+SUBST(int, posix_spawnp, (pid_t *pid, char const *file, const posix_spawn_file_actions_t *facts, const posix_spawnattr_t *attrp, char *argv[], char *envp[]))
+    spawnp_resolved(pid, file, facts, attrp, argv, envp);
 ENDSUBST
 
 SUBST(void *, dlopen, (char const *path, int mode))
@@ -90,9 +132,35 @@ SUBST(void *, dlopen, (char const *path, int mode))
     my_dlopen(path, mode);
 ENDSUBST
 
-SUBST(int, openat, (int fd, char const *name, int flags, int mode))
-    openat(fd, rs_at_flagged(fd, name, flags), flags, mode);
-ENDSUBST
+// open() and openat() take `mode` as a *variadic* argument. On arm64 the
+// Apple ABI passes variadic args on the stack but named args in registers,
+// so declaring mode as a named parameter reads garbage. These two must be
+// interposed with genuinely variadic signatures.
+int _my_openat(int fd, char const *name, int flags, ...);
+__attribute__((used, section("__DATA,__interpose")))
+    static void *_openat[] = { _my_openat, openat };
+int _my_openat(int fd, char const *name, int flags, ...)
+{
+    int mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    pthread_mutex_lock(&_lock);
+    DEBUG("Now serving %s", "openat");
+    // `flags` here are O_* flags, not AT_* flags
+    char const *n;
+    int rfd = (fd == AT_FDCWD) ? -1 : fd;
+    if (flags & (O_SYMLINK|O_NOFOLLOW))
+        n = resolve_symlink_parent(rfd, name);
+    else
+        n = resolve_symlink_at(rfd, name);
+    int _r = openat(fd, n, flags, mode);
+    pthread_mutex_unlock(&_lock);
+    return _r;
+}
 
 SUBST(int, lstat, (char const *path, struct stat *buf))
     lstat(RS_PARENT(path), buf);
@@ -168,7 +236,8 @@ SUBST(int, symlink, (char const *what, char const *path))
 ENDSUBST
 
 SUBST(int, symlinkat, (char const *what, int fd, char const *path))
-    symlinkat(what, fd, rs_at_flagged(fd, path, 0));
+    // never resolve the final component: we are creating it
+    symlinkat(what, fd, rs_at_flagged(fd, path, AT_SYMLINK_NOFOLLOW));
 ENDSUBST
 
 SUBST(ssize_t, readlink, (char const *path, char *buf, size_t bsz))
@@ -176,7 +245,8 @@ SUBST(ssize_t, readlink, (char const *path, char *buf, size_t bsz))
 ENDSUBST
 
 SUBST(ssize_t, readlinkat, (int fd, char const *path, char *buf, size_t bsz))
-    readlinkat(fd, rs_at_flagged(fd, path, 0), buf, bsz);
+    // never resolve the final component: we are reading the link itself
+    readlinkat(fd, rs_at_flagged(fd, path, AT_SYMLINK_NOFOLLOW), buf, bsz);
 ENDSUBST
 
 SUBST(FILE *, fopen, (char const *path, char const *mode))
@@ -187,9 +257,24 @@ SUBST(FILE *, freopen, (char const *path, char const *mode, FILE *orig))
     freopen(resolve_symlink(path), mode, orig);
 ENDSUBST
 
-SUBST(int, open, (char const *name, int flags, int mode))
-    my_open(name, flags, mode);
-ENDSUBST
+int _my_open2(char const *name, int flags, ...);
+__attribute__((used, section("__DATA,__interpose")))
+    static void *_open[] = { _my_open2, open };
+int _my_open2(char const *name, int flags, ...)
+{
+    int mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    pthread_mutex_lock(&_lock);
+    DEBUG("Now serving %s", "open");
+    int _r = my_open(name, flags, mode);
+    pthread_mutex_unlock(&_lock);
+    return _r;
+}
 
 SUBST(int, clonefile, (char const *path1, char const *path2, int flags))
     clonefile( (flags & CLONE_NOFOLLOW) ? RS_PARENT(path1)
@@ -224,6 +309,14 @@ ENDSUBST
 
 SUBST(int, utimes, (char const *path, struct timeval times[2]))
     utimes(resolve_symlink(path), times);
+ENDSUBST
+
+SUBST(int, lutimes, (char const *path, struct timeval times[2]))
+    lutimes(RS_PARENT(path), times);
+ENDSUBST
+
+SUBST(int, utimensat, (int fd, char const *path, const struct timespec times[2], int flag))
+    utimensat(fd, rs_at_flagged(fd, path, flag), times, flag);
 ENDSUBST
 
 SUBST(int, rename, (char const *from, char const *to))
