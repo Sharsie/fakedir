@@ -2,15 +2,13 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <sys/syslimits.h>
+#include <limits.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <errno.h>
-#include <sys/clonefile.h>
-#include <sys/attr.h>
 #include <sys/time.h>
 #include <sys/param.h>
 #include <sys/mount.h>
@@ -20,7 +18,14 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+// Apple-only headers are guarded so that pathresolve.c (pure path logic)
+// can be compiled and unit-tested on any POSIX host (`make check`).
+#ifdef __APPLE__
+#include <sys/syslimits.h>
+#include <sys/clonefile.h>
+#include <sys/attr.h>
 #include <mach-o/dyld.h>
+#endif
 
 /**
  * @file        common.h
@@ -64,6 +69,23 @@ extern const char *target;
  *          instead.
  */
 #define PSP_EXEC (pid_t *) -15
+
+/**
+ * @brief   Size of internal path buffers.
+ *
+ * Deliberately larger than PATH_MAX: rewriting PATTERN to a longer TARGET
+ * grows paths, and silently truncating the result at PATH_MAX could turn it
+ * into a *different, existing* path (an ancestor), redirecting reads, writes
+ * or unlinks. With the headroom we can detect overlong results and fail them
+ * deterministically instead (see rewrite_path).
+ */
+#define FAKEDIR_BUFSZ 4096
+
+/**
+ * @brief   Prime the rewrite buffers from the pattern/target globals.
+ *          Must be called once before any rewrite_path/resolve_* use.
+ */
+void rewrite_init(void);
 
 #ifndef STRIP_DEBUG
 /**
