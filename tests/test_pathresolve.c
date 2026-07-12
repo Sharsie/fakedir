@@ -186,11 +186,15 @@ int main(void)
 
     // --- oversize handling ------------------------------------------------
     {
-        // long but valid: must come back complete, never truncated
+        // long but valid: must come back complete, never truncated.
+        // Sized so the rewritten path stays under PATH_MAX even on macOS
+        // (1024 there, 4096 on Linux) - anything longer passes through
+        // unrewritten, which the next case covers.
         char longp[2048];
         int n = snprintf(longp, sizeof longp, "/fnix/store/");
-        memset(longp + n, 'a', 1500);
-        longp[n + 1500] = 0;
+        size_t fill = PATH_MAX - 1 - strlen(tgt) - (n - strlen("/fnix"));
+        memset(longp + n, 'a', fill);
+        longp[n + fill] = 0;
         const char *r = resolve_symlink_at(-1, longp);
         checks++;
         if (strlen(r) != strlen(longp) - strlen("/fnix") + strlen(tgt)
@@ -201,16 +205,28 @@ int main(void)
             printf("ok   long path resolved without truncation (len %zu)\n", strlen(r));
         }
 
-        // absurdly long: must fail via the unresolvable marker, not truncate
+        // at/over PATH_MAX: passed through verbatim so the kernel reports
+        // ENAMETOOLONG, exactly as it would on a rooted install (nodejs'
+        // filename-too-long tests assert that errno). Never truncated.
         static char huge[FAKEDIR_BUFSZ + 100];
         huge[0] = '/';
         memset(huge + 1, 'b', sizeof huge - 2);
         huge[sizeof huge - 1] = 0;
         const char *m = resolve_symlink_at(-1, huge);
-        expect_true("oversize input yields unresolvable marker",
-                    m && m[0] == '/' && m[1] == '\1');
-        expect_true("marker cannot be opened",
-                    open(m, O_RDONLY) == -1 && errno == ENOENT);
+        expect_true("oversize input passes through verbatim", m == huge);
+        expect_true("oversize open fails ENAMETOOLONG",
+                    open(m, O_RDONLY) == -1 && errno == ENAMETOOLONG);
+
+        // input legal, rewritten form too long: the unresolvable marker
+        // (clean ENOENT, cannot name a real file, cannot be re-truncated
+        // into one)
+        char edge[PATH_MAX];
+        int en = snprintf(edge, sizeof edge, "/fnix/store/");
+        memset(edge + en, 'c', PATH_MAX - 1 - en);
+        edge[PATH_MAX - 1] = 0;
+        const char *e = resolve_symlink_at(-1, edge);
+        expect_true("rewrite overflow yields unresolvable marker",
+                    e && e[0] == '/' && e[1] == '\1');
     }
 
     printf("\n%d/%d checks passed\n", checks - failures, checks);

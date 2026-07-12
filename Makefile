@@ -1,10 +1,11 @@
-libfakedir.dylib: fakedir.o trivial_replacements.o execve.o pathresolve.o
+libfakedir.dylib: fakedir.o trivial_replacements.o execve.o pathresolve.o fsevents.o
 	$(CC) $(CFLAGS) -shared $^ -o $@
 
 fakedir.o: fakedir.c common.h execve.h
 trivial_replacements.o: trivial_replacements.c common.h
 execve.o: execve.c common.h
 pathresolve.o: pathresolve.c common.h
+fsevents.o: fsevents.c common.h
 
 # Unit tests for the path resolution logic; runs on any POSIX host,
 # no macOS required.

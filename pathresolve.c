@@ -20,12 +20,17 @@ static char rpathbuf[FAKEDIR_BUFSZ];
 static char dedupbuf[FAKEDIR_BUFSZ];
 
 /*
- * Returned whenever a rewritten path would no longer fit PATH_MAX (or our
- * buffers). It contains a control character, so it cannot name an existing
- * file: the calling syscall fails with a clean ENOENT instead of operating
- * on a silently truncated - and possibly existing - path. It is also short,
- * so callers copying results into PATH_MAX buffers cannot re-truncate it
- * into something meaningful.
+ * Inputs already at or over PATH_MAX are returned verbatim instead: the
+ * kernel refuses the string with ENAMETOOLONG before looking at the
+ * filesystem, which is exactly what a rooted install would report (and
+ * what e.g. nodejs' filename-too-long tests assert). The marker below is
+ * only for the remaining edge - an input short enough to be legal whose
+ * *rewritten* form no longer fits PATH_MAX (or our buffers). It contains a
+ * control character, so it cannot name an existing file: the calling
+ * syscall fails with a clean ENOENT instead of operating on a silently
+ * truncated - and possibly existing - path. It is also short, so callers
+ * copying results into PATH_MAX buffers cannot re-truncate it into
+ * something meaningful.
  */
 static const char overflow_marker[] = "/\1fakedir-name-too-long";
 
@@ -56,9 +61,9 @@ char const *rewrite_path(char const *path)
     // check would also mangle real dotfiles like "/.vol/..."
     if (startswith("/./", path))
         path += 2;
-    if (strlen(path) >= FAKEDIR_BUFSZ) {
-        DEBUG("rewrite_path: input longer than %d, failing '%s'", FAKEDIR_BUFSZ, path);
-        return overflow_marker;
+    if (strlen(path) >= PATH_MAX) {
+        DEBUG("rewrite_path: input exceeds PATH_MAX, passing through");
+        return path;
     }
     if (pattern && startswith(pattern, path)) {
         size_t target_len = strlen(target);
@@ -80,9 +85,9 @@ char const *rewrite_path_rev(char const *path)
 {
     if (startswith("/./", path))
         path += 2;
-    if (strlen(path) >= FAKEDIR_BUFSZ) {
-        DEBUG("rewrite_path_rev: input longer than %d, failing '%s'", FAKEDIR_BUFSZ, path);
-        return overflow_marker;
+    if (strlen(path) >= PATH_MAX) {
+        DEBUG("rewrite_path_rev: input exceeds PATH_MAX, passing through");
+        return path;
     }
     if (target && startswith(target, path)) {
         size_t pattern_len = strlen(pattern);
@@ -132,8 +137,12 @@ static char const *resolve_path_common(int fd, char const *path, bool keep_last)
         return res;
     }
 
-    if (strlen(path) >= FAKEDIR_BUFSZ)
-        return overflow_marker;
+    if (strlen(path) >= PATH_MAX) {
+        // no resolution attempted: the kernel rejects the string with
+        // ENAMETOOLONG before path lookup, same as a rooted install
+        DEBUG("resolve: input exceeds PATH_MAX, passing through");
+        return path;
+    }
 
     bool is_abs = (path[0] == '/');
     if (fd == AT_FDCWD)

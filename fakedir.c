@@ -35,6 +35,10 @@ pthread_mutex_t _lock;
 const char *pattern;
 const char *target;
 
+static void __fakedir_atfork_prepare(void) { pthread_mutex_lock(&_lock); }
+static void __fakedir_atfork_parent(void)  { pthread_mutex_unlock(&_lock); }
+static void __fakedir_atfork_child(void)   { pthread_mutex_init(&_lock, NULL); }
+
 __attribute__((constructor))
 static void __fakedir_init(void)
 {
@@ -81,6 +85,14 @@ static void __fakedir_init(void)
     rewrite_init();
 
     pthread_mutex_init(&_lock, NULL);
+    // A fork while another thread sits inside an interposer leaves the
+    // child's _lock locked forever - python's test runners fork worker
+    // processes from threaded parents and deadlocked on the first
+    // interposed syscall. Serialize fork against the lock, and hand the
+    // child a fresh mutex.
+    pthread_atfork(__fakedir_atfork_prepare,
+                   __fakedir_atfork_parent,
+                   __fakedir_atfork_child);
     DEBUG("Initialized libfakedir with subtitution '%s' => '%s'", pattern, target);
     _loaded = true;
 }
@@ -97,6 +109,43 @@ static void __fakedir_fini(void)
 
 // startswith/endswith, rewrite_path{,_rev} and the resolve_* family live in
 // pathresolve.c so they can be unit-tested off-macOS (`make check`).
+
+// Last-resort store shell for the /bin/sh redirect below: when PATH offers
+// no non-protected sh/bash, fall back to any bash in the store (its bin/sh).
+// npm/pnpm .bin/* shims are `#!/bin/sh` scripts that `exec node`, and are
+// commonly run with a minimal PATH (e.g. a `nix run` wrapper exporting only
+// nodejs/bin) - without this the redirect fails, the protected /bin/sh runs
+// them, and /nix (hence node) is invisible. Scanned once and cached; returns
+// a logical /nix path so normal injection applies, or NULL if none exists.
+static char const *store_shell(void)
+{
+    static char cached[PATH_MAX];
+    static int state;   // 0 = unknown, 1 = found, -1 = none
+    if (state)
+        return state == 1 ? cached : NULL;
+
+    char storedir[PATH_MAX];
+    snprintf(storedir, sizeof storedir, "%s/store", target);
+    DIR *d = opendir(storedir);
+    if (!d) { state = -1; return NULL; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strstr(e->d_name, "-bash-"))
+            continue;
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof probe, "%s/%s/bin/sh", storedir, e->d_name);
+        if (access(probe, X_OK) == 0) {
+            snprintf(cached, sizeof cached, "%s/store/%s/bin/sh",
+                     pattern, e->d_name);
+            state = 1;
+            closedir(d);
+            return cached;
+        }
+    }
+    closedir(d);
+    state = -1;
+    return NULL;
+}
 
 int my_posix_spawn(pid_t *pid, char const *path, const posix_spawn_file_actions_t *facts, const posix_spawnattr_t *attrp, char *argv[], char *envp[])
 {
@@ -125,6 +174,13 @@ int my_posix_spawn(pid_t *pid, char const *path, const posix_spawn_file_actions_
                     break;
                 }
             }
+        }
+        // PATH had no usable shell: fall back to a store bash rather than
+        // exec the protected /bin/sh and lose the injection.
+        if (!strcmp(path, "/bin/sh")) {
+            char const *sh = store_shell();
+            if (sh)
+                path = sh;
         }
     }
 
